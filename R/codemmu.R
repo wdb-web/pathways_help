@@ -5,11 +5,12 @@
 #' @importMethodsFrom clusterProfiler enrichResult compareClusterResult
 #' @import purrr
 #' @import dplyr
+#' @import data.table
 #' @importFrom stringr str_split str_locate_all str_sub str_remove str_match
 #' @importFrom methods setClass news 
 #' @importFrom data.table  fread
 #' @importFrom ggplot2 `+` ggplot aes geom_point theme_bw
-
+ 
 setClass("metaProfiler",
          slots = c(
            kegg_analyst = "list",
@@ -32,20 +33,49 @@ setClass("metaProfiler",
 )
   
 {#import_model=c("betweenness","degree")
-  .get_import <- function(enrichKEGG,import_model="betweenness") {
-    combn(enrichKEGG@result[,c(2)], m=2)%>%as.data.frame()%>%
-      purrr::map_dfr(function(x){enrichKEGG@result%>%dplyr::filter(Description %in% unlist(x))%>%
-          dplyr::summarise(geneIDl=geneID%>%str_split("/")%>%unlist()%>%duplicated()%>%sum())->d
-        return(c( unlist(x),d)%>%unlist())
-      })%>%t%>%as.data.frame()%>%dplyr::filter(V3>0)->l
+  .get_import <- function(enrichKEGG,import_model="degree",kegg_org) {
+    
+    kegg_org%>%as.data.frame%>%.[,colnames(kegg_org)%in% c("path","Compound_ID")]->base
+    base  %>%unique( )->base
+    base%>%dplyr::filter( path %in%enrichKEGG@result$Description )->base
+    as.data.table(base)->base
+    base[ , if (.N > 1) 
+      transpose(combn(  unique(path), 2L, simplify = FALSE)), by = Compound_ID
+    ][ , .(Sum = .N), keyby = .(Group.1 = V1, Group.2 = V2)]->l
+    colnames(l)<-c("from","to","weight")
+    net_pc<-igraph::graph_from_data_frame(
+      d=l, directed=F)
+    
+    g <- igraph::set_edge_attr(net_pc, "weight", value= l$weight)
+    
+    if(import_model[1]=="betweenness"){
+      igraph::betweenness(net_pc)->import_min}
+    if(import_model[1]=='degree'){
+      igraph::degree(net_pc, mode='total', loops=FALSE)->import_min}
+    import_min%>%as.data.frame()%>%mutate(name = rownames(import_min))->import_min
+    import_min%>%as.data.frame()%>%mutate(name = rownames(import_min))->import_min
+    
+    enrichKEGG@result  ->d2
+    d2%>%dplyr::group_by(Description )%>%dplyr::summarise(geneID %>% str_split("/")%>%unlist())%>%setNames(c("path", "Compound_ID" ))%>%
+      ungroup()%>%as.data.table()->da
+    da[ , if (.N > 1) 
+      transpose(combn(path, 2L, simplify = FALSE)), by = Compound_ID
+    ][ , .(Sum = .N), keyby = .(Group.1 = V1, Group.2 = V2)]->l 
+    colnames(l)<-c("from","to","weight")
+    
     net_pc<-igraph::graph_from_data_frame(
       d=l,
       directed=F)
+    g <- igraph::set_edge_attr(net_pc, "weight", value= l$weight)
     if(import_model[1]=="betweenness"){
-      igraph::betweenness(net_pc,normalized = T)->import}
+      igraph::betweenness(net_pc)%>%as.data.frame()->import}
     if(import_model[1]=='degree'){
-      igraph::degree(net_pc,normalized = T, mode='total', loops=FALSE)->import}
-    import%>%as.data.frame()->import
+      igraph::degree(net_pc, mode='total', loops=FALSE)->import}
+    import%>%as.data.frame()%>%mutate(name = rownames(import))->import
+    import%>%as.data.frame()%>%mutate(name = rownames(import))->import
+    
+    left_join(import,import_min,by="name")%>%
+      {.[,1]/.[,3]}%>%setNames(left_join(import,import_min,by="name")%>%.$name)%>%as.data.frame()->import
     colnames(import)<-"import"
     import$Description <-import%>%rownames()
     enrichKEGG@keytype<-"kegg"
@@ -247,31 +277,31 @@ setClass("metaProfiler",
     return(NULL)
   }
 
-  .get_kegg_p<- function(value=data,kegg_pathways=kegg_pathways,fisher.alternative=fisher.alternative,
+  .get_kegg_p<- function(value=data,kegg_pathways=kegg_pathways,p_model=p_model,
                          p.adjust.methods=p.adjust.methods,qvalue.methods=qvalue.methods) {
     value%>%unique()->data
     kegg_pathways%>%as.data.frame()->match.df
-
-
     kegg_pathways%>%group_by(Compound_ID)%>%summarise(n()-1)->import
     kegg_pathways%>%group_by(path)%>%
       summarise(n=sum( data%in%Compound_ID),N=n(),
                 m=sum( data%in%kegg_pathways$Compound_ID),M=kegg_pathways$Compound_ID%>%unique%>%length,
-                Compound_ID=paste(Compound_ID[Compound_ID%in%value],
+                Compound_ID=paste(unique(Compound_ID[Compound_ID%in%value]),
                                   collapse = "/"))%>%ungroup()%>%
       dplyr::filter(n>0)->n
-    fisher<-function(data,alternative=alternative){
-      data->d
-      gene.not.interest=data.frame(c(d[3]-d[1]),c(d[4]-d[2]))%>%t;
-      gene.in.interest=data.frame(d[1],d[3])%>%t
+    fisher<-function(data,model=c("phyper","fisher")){
+      gene.not.interest=data.frame(c(d[3]-d[1]),c(d[4]-d[2]-d[3]+d[1])) %>% t;
+      gene.in.interest=data.frame(d[1],d[3]) %>% t
       d <- data.frame(gene.not.interest,gene.in.interest)
-      fisher.test(d, alternative =alternative )[["p.value"]]%>%return()
+      if(model[1]=="fisher"){return(fisher.test(d, alternative ="greater" )[["p.value"]])}
+      # k -》 富集到通路，n 总的差异基因，N 所有基因，M 这条通路基因
+      data -> d
+      if(model[1]=="phyper"){return(phyper(d[1]-1,d[3], d[4]-d[3], d[2], lower.tail=F))}
+     cat("using model is ","phyper or","fisher")
     }
     n[2,2:5]->d
-    apply(n[,2:5],1, fisher,alternative=fisher.alternative)->n$pvalue
+    apply(n[,2:5],1, fisher,model=p_model)->n$pvalue
     p.adjust(n$pvalue,method =p.adjust.methods)->n$p.adjust
     p.adjust(n$pvalue,method =qvalue.methods)->n$qvalue
-
     kegg_pathways$path[kegg_pathways$Compound_ID%in% import$Compound_ID[import$Compound_ID%in%value]]%>%
       {kegg_pathways$Compound_ID[kegg_pathways$path%in%.]}->every_diff_pathways_com
     kegg_pathways%>%group_by(path)%>%
@@ -291,13 +321,13 @@ setClass("metaProfiler",
 
   #name<-data
   .get_kegg_analyst<-function(name="list Compound_ID or gean",
-                              org="hsa",fisher.alternative="two.sided",
+                              org="hsa",p_model=c("phyper","fisher"),
                               kegg_pathways=kegg_pathways,p.adjust.methods=p.adjust.methods,
-                              qvalue.methods="fdr",enrichKEGG=kk,import_model=import_model
+                              qvalue.methods="fdr",enrichKEGG=kk,import_model=import_model,everyorg=everyorg
   ){
     if(name[1]%>%str_match("C[0-9][0-9][0-9][0-9][0-9]")%>%{!is.na(.)}){
-      .get_kegg_p(value=name,kegg_pathways=kegg_pathways,
-                  fisher.alternative=fisher.alternative,
+      .get_kegg_p(value=name%>%unique(),kegg_pathways=kegg_pathways,
+                  p_model=p_model,
                   p.adjust.methods=p.adjust.methods,qvalue.methods=qvalue.methods)->y
       rownames(y)<-y$ID
       enrichKEGG@result<-y
@@ -316,7 +346,8 @@ setClass("metaProfiler",
       enrichKEGG@qvalueCutoff<-1
       enrichKEGG@pAdjustMethod<-p.adjust.methods
       enrichKEGG@universe<-""
-      .get_import(enrichKEGG,import_model=import_model)->enrichKEGG
+      .get_import(enrichKEGG,import_model=import_model,kegg_org  = everyorg)->enrichKEGG
+      enrichKEGG@result[order(enrichKEGG@result$pvalue),]->enrichKEGG@result
       return(enrichKEGG)
     }
     if(name[1]%>%str_match("C[0-9][0-9][0-9][0-9][0-9]*")%>%{is.na(.)}){
@@ -328,13 +359,13 @@ setClass("metaProfiler",
 
   }
 
-  kegg_pathway1 <- function(data=c("list"),org="mmu",fisher.alternative="two.sided",
-                            p.adjust.methods="holm",import_model=c("betweenness","degree")) {
+  kegg_pathway1 <- function(data=c("list"),org="mmu",p_model=c("phyper","fisher"),
+                            p.adjust.methods="holm",import_model=c("degree","betweenness")) {
 
 
-    get_org(org =org )->kegg_pathways
-    kegg_pathways[kegg_pathways$path!="Metabolic pathways",]->kegg_pathways
-    s <- new("metaProfiler",org_organism=org)
+    get_org(org = org ) ->kegg_pathways
+    kegg_pathways[kegg_pathways$path !="Metabolic pathways",] -> kegg_pathways
+    s <- new("metaProfiler",org_organism =org)
     s@org<-kegg_pathways%>%as.data.frame()
     # get_anong(org)%>%.[[1]]->bb
     # bb->>bb
@@ -343,13 +374,13 @@ setClass("metaProfiler",
     kk <- new("enrichResult",organism=org,ontology="KEGG")
     if(is.list(data)&(length(data)==1)){
       .get_kegg_analyst(name = data[[1]],org = org,kegg_pathways=kegg_pathways,import_model=import_model,
-                        fisher.alternative=fisher.alternative,p.adjust.methods=p.adjust.methods,
+                        p_model=p_model,p.adjust.methods=p.adjust.methods,everyorg = kegg_pathways,
                         enrichKEGG=kk)%>%list->s@kegg_analyst
       names(s@kegg_analyst)<-"enrichKEGG"
       return(s)
     }
     if(!is.list(data)){.get_kegg_analyst(name = data,org = org,kegg_pathways=kegg_pathways,
-                                         fisher.alternative=fisher.alternative,
+                                         p_model=p_model,everyorg = kegg_pathways,
                                          p.adjust.methods=p.adjust.methods,import_model=import_model,
                                          enrichKEGG=kk)%>%list->s@kegg_analyst
       names(s@kegg_analyst)<-"enrichKEGG"
@@ -357,8 +388,8 @@ setClass("metaProfiler",
     }
     #data[[1]]->name
     data%>%
-      purrr::map(~.get_kegg_analyst(name = .x,org = org,kegg_pathways=kegg_pathways,import_model=import_model,enrichKEGG=kk,
-                                    fisher.alternative=fisher.alternative,p.adjust.methods=p.adjust.methods))->y
+      purrr::map(~.get_kegg_analyst(name = .x,org = org,kegg_pathways=kegg_pathways,import_model=import_model,enrichKEGG=kk,everyorg = kegg_pathways,
+                                    p_model=p_model,p.adjust.methods=p.adjust.methods))->y
 
 
     x <- new("compareClusterResult")

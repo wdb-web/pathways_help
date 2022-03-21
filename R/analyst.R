@@ -71,13 +71,13 @@ setClass("metaProfiler",
 ##' # or
 ##' load(system.file("data", "Tes.Rdata",package = "pathways"))
 ##' }
-pathways_analy <- function(data,group,org="hsa",fisher.alternative="two.sided",
+pathways_analy <- function(data,group,org="hsa",p_model=c("phyper","fisher"),
                            scale=T,
                  p.adjust.methods="holm",import_model=c("betweenness","degree")) {
   if(is.list(data)){data%>%purrr::map(colnames)%>%
-    kegg_pathway1(data = . ,org = org,p.adjust.methods=p.adjust.methods,fisher.alternative = fisher.alternative,
+    kegg_pathway1(data = . ,org = org,p.adjust.methods=p.adjust.methods,p_model = p_model,
                   import_model=import_model)->y}else{
-    kegg_pathway1(data =colnames(data) ,org = org,p.adjust.methods=p.adjust.methods,fisher.alternative = fisher.alternative,
+    kegg_pathway1(data =colnames(data) ,org = org,p.adjust.methods=p.adjust.methods,p_model = p_model,
                        import_model=import_model)->y}
   .get_data_analyst_plot( data=data,group = group,scale = scale)->h
   slot(y, "data_mixOmics_analyst") <- list(h$analyst_data)
